@@ -7,6 +7,7 @@ using GameFormatReader.Common;
 using System.IO;
 using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Imaging;
 using Hymma.Util;
 
 namespace Hymma.Image
@@ -24,13 +25,23 @@ namespace Hymma.Image
         public Bitmap Image
         {
             get { return m_Image; }
-            private set { m_Image = value; }
+            set { m_Image = value; }
         }
 
         private Bitmap m_Image;
 
+        public TIM() { }
+
         public TIM(string file_name)
         {
+            // Load a png. Simple!
+            if (Path.GetExtension(file_name) == ".png")
+            {
+                m_Image = new Bitmap(file_name);
+                return;
+            }
+
+            // Need to load a TIM.
             using (FileStream strm = new FileStream(file_name, FileMode.Open))
             {
                 EndianBinaryReader reader = new EndianBinaryReader(strm, Endian.Little);
@@ -52,6 +63,12 @@ namespace Hymma.Image
             Load_TIM(reader);
         }
 
+        public TIM(Bitmap bmp)
+        {
+            m_Image = bmp;
+        }
+
+        #region Loading
         private void Load_TIM(EndianBinaryReader reader)
         {
             Debug.Assert(reader.ReadInt32() == 16, "TIM file did not have the correct magic!");
@@ -61,145 +78,239 @@ namespace Hymma.Image
             BitsPerPixel bits_per_pixel = (BitsPerPixel)(flags & 3);
             bool has_clut = (flags & 8) == 0 ? false : true;
 
-            switch (bits_per_pixel)
+            if (has_clut)
+            {
+                Load_TIM_With_CLUT(reader, bits_per_pixel);
+            }
+            else
+            {
+                Load_TIM_No_CLUT(reader, bits_per_pixel);
+            }
+        }
+
+        private void Load_TIM_With_CLUT(EndianBinaryReader reader, BitsPerPixel bpp)
+        {
+            PixelFormat pix_fmt = TIM_bpp_To_PixelFormat(bpp);
+
+            int clut_size = reader.ReadInt32();
+            short clut_origin_x = reader.ReadInt16();
+            short clut_origin_y = reader.ReadInt16();
+
+            int color_count = reader.ReadInt16();
+            int pal_count = reader.ReadInt16();
+
+            List<Color>[] palettes = new List<Color>[pal_count];
+
+            for (int i = 0; i < pal_count; i++)
+            {
+                palettes[i] = Load_CLUT(reader, color_count);
+            }
+
+            int image_index = 0;
+            float width_modifier = Get_Width_Modifier(bpp);
+
+            while (reader.BaseStream.Position < reader.BaseStream.Length)
+            {
+                int image_size = reader.ReadInt32();
+                short image_origin_x = reader.ReadInt16();
+                short image_origin_y = reader.ReadInt16();
+
+                int image_width = reader.ReadInt16();
+                int image_height = reader.ReadInt16();
+
+                m_Image = new Bitmap((int)(image_width * width_modifier), image_height, pix_fmt);
+                ColorPalette pal = m_Image.Palette;
+
+                for (int i = 0; i < color_count; i++)
+                {
+                    pal.Entries[i] = palettes[image_index][i];
+                }
+
+                m_Image.Palette = pal;
+                BitmapData img_data = m_Image.LockBits(new Rectangle(0, 0, (int)(image_width * width_modifier), image_height),
+                    ImageLockMode.ReadWrite, pix_fmt);
+
+                for (int y = 0; y < image_height; y++)
+                {
+                    for (int x = 0; x < image_width * 2; x++)
+                    {
+                        byte src = reader.ReadByte();
+
+                        if (bpp == BitsPerPixel.bpp_4)
+                        {
+                            byte temp = (byte)((src & 0x0F) << 4);
+                            src >>= 4;
+                            src |= temp;
+                        }
+
+                        System.Runtime.InteropServices.Marshal.WriteByte(img_data.Scan0, (y * img_data.Stride) + x, src);
+                    }
+                }
+
+                m_Image.UnlockBits(img_data);
+                image_index++;
+            }
+        }
+
+        private void Load_TIM_No_CLUT(EndianBinaryReader reader, BitsPerPixel bpp)
+        {
+            Debug.Assert(false, "Found a 16 or 24bpp image!");
+        }
+
+        private List<Color> Load_CLUT(EndianBinaryReader reader, int count)
+        {
+            List<Color> pal = new List<Color>();
+
+            for (int j = 0; j < count; j++)
+            {
+                short color = reader.ReadInt16();
+
+                int red = (color & 0x1F) * 8;
+                int green = ((color & 0x3E0) >> 5) * 8;
+                int blue = ((color & 0x7C00) >> 10) * 8;
+
+                pal.Add(Color.FromArgb(red, green, blue));
+            }
+
+            return pal;
+        }
+
+        private PixelFormat TIM_bpp_To_PixelFormat(BitsPerPixel bpp)
+        {
+            switch (bpp)
             {
                 case BitsPerPixel.bpp_4:
-                    if (has_clut)
-                    {
-                        Load_4_BPP_Image_CLUT(reader);
-                    }
-                    else
-                    {
-                        Load_4_BPP_Image_No_CLUT(reader);
-                    }
-                    break;
+                    return PixelFormat.Format4bppIndexed;
                 case BitsPerPixel.bpp_8:
-                    if (has_clut)
-                    {
-                        Load_8_BPP_Image_CLUT(reader);
-                    }
-                    else
-                    {
-                        Load_4_BPP_Image_No_CLUT(reader);
-                    }
-                    break;
+                    return PixelFormat.Format8bppIndexed;
                 case BitsPerPixel.bpp_16:
-                    break;
+                    return PixelFormat.Format16bppRgb555;
                 case BitsPerPixel.bpp_24:
-                    break;
+                    return PixelFormat.Format24bppRgb;
                 default:
-                    Debug.Assert(false, "Invalid bpp type " + bits_per_pixel + "!");
-                    break;
+                    return PixelFormat.DontCare;
             }
         }
 
-        private void Load_4_BPP_Image_CLUT(EndianBinaryReader reader)
+        private float Get_Width_Modifier(BitsPerPixel bpp)
         {
-            int clut_size = reader.ReadInt32() - 12; // The header is 12 bytes long
-
-            short clut_offset_x = reader.ReadInt16();
-            short clut_offset_y = reader.ReadInt16();
-
-            Debug.Assert(reader.ReadInt16() == 16, "CLUT color count wasn't 16! (4bpp image)");
-
-            short clut_count = reader.ReadInt16();
-
-            List<Color>[] clut_colors = new List<Color>[clut_count];
-            for (int i = 0; i < clut_count; i++)
+            switch (bpp)
             {
-                clut_colors[i] = new List<Color>();
-
-                for (int j = 0; j < 16; j++)
-                {
-                    short color = reader.ReadInt16();
-
-                    int red = (color & 0x1F) * 8;
-                    int green = ((color & 0x3E0) >> 5) * 8;
-                    int blue = ((color & 0x7C00) >> 10) * 8;
-
-                    clut_colors[i].Add(Color.FromArgb(red, green, blue));
-                }
-            }
-
-            int image_size = reader.ReadInt32() - 12; // The header is 12 bytes long
-
-            short image_offset_x = reader.ReadInt16();
-            short image_offset_y = reader.ReadInt16();
-
-            int image_width = reader.ReadInt16() * 4; // Multiply the stored value by 4 to get actual width
-            int image_height = reader.ReadInt16();
-
-            m_Image = new Bitmap(image_width, image_height);
-
-            for (int y = 0; y < image_height; y++)
-            {
-                for (int x = 0; x < image_width; x += 2)
-                {
-                    byte src = reader.ReadByte();
-
-                    int pix_2 = (src & 0xF0) >> 4;
-                    int pix_1 = src & 0xF;
-
-                    m_Image.SetPixel(x, y, clut_colors[0][pix_1]);
-                    m_Image.SetPixel(x + 1, y, clut_colors[0][pix_2]);
-                }
+                case BitsPerPixel.bpp_4:
+                    return 4.0f;
+                case BitsPerPixel.bpp_8:
+                    return 2.0f;
+                case BitsPerPixel.bpp_16:
+                    return 1.0f;
+                case BitsPerPixel.bpp_24:
+                    return 0.5f;
+                default:
+                    return 1.0f;
             }
         }
+        #endregion
 
-        private void Load_4_BPP_Image_No_CLUT(EndianBinaryReader reader)
+        #region Saving
+        public void Save_PNG(string file_name)
         {
-
+            m_Image.Save(file_name);
         }
 
-        private void Load_8_BPP_Image_CLUT(EndianBinaryReader reader)
+        public void Save_TIM(string file_name)
         {
-            int clut_size = reader.ReadInt32() - 12; // The header is 12 bytes long
+            BitsPerPixel bpp = PixelFormat_To_TIM_BPP(m_Image.PixelFormat);
 
-            short clut_offset_x = reader.ReadInt16();
-            short clut_offset_y = reader.ReadInt16();
-
-            Debug.Assert(reader.ReadInt16() == 256, "CLUT color count wasn't 256! (8bpp image)");
-
-            short clut_count = reader.ReadInt16();
-
-            List<Color>[] clut_colors = new List<Color>[clut_count];
-            for (int i = 0; i < clut_count; i++)
+            using (FileStream strm = new FileStream(file_name, FileMode.Create))
             {
-                clut_colors[i] = new List<Color>();
+                EndianBinaryWriter writer = new EndianBinaryWriter(strm, Endian.Little);
+                int color_count = 0;
+                int width_modifier = 0;
+                List<Color> palette_colors = new List<Color>(m_Image.Palette.Entries);
 
-                for (int j = 0; j < 256; j++)
+                writer.Write(16);
+
+                switch (m_Image.PixelFormat)
                 {
-                    short color = reader.ReadInt16();
+                    case PixelFormat.Format4bppIndexed:
+                        writer.Write(8 | (int)BitsPerPixel.bpp_4);
+                        color_count = 16;
+                        width_modifier = 4;
+                        break;
+                    case PixelFormat.Format8bppIndexed:
+                        writer.Write(8 | (int)BitsPerPixel.bpp_8);
+                        color_count = 256;
+                        width_modifier = 2;
+                        break;
+                    default:
+                        return;
+                }
 
-                    int red = (color & 0x1F) * 8;
-                    int green = ((color & 0x3E0) >> 5) * 8;
-                    int blue = ((color & 0x7C00) >> 10) * 8;
+                writer.Write(12 + (color_count * 2));
+                writer.Write(0);
+                writer.Write((short)color_count);
+                writer.Write((short)1);
 
-                    clut_colors[i].Add(Color.FromArgb(red, green, blue));
+                for (int i = 0; i < m_Image.Palette.Entries.Length; i++)
+                {
+                    Color col = m_Image.Palette.Entries[i];
+
+                    int final_color = col.R / 8;
+                    final_color |= (col.G / 8) << 5;
+                    final_color |= (col.B / 8) << 10;
+
+                    writer.Write((short)final_color);
+                }
+
+                for (int i = 0; i < color_count - m_Image.Palette.Entries.Length; i++)
+                {
+                    writer.Write((short)0);
+                }
+
+                writer.Write(12 + ((m_Image.Width / 2) * m_Image.Height));
+                writer.Write(0);
+
+                writer.Write((short)(m_Image.Width / width_modifier));
+                writer.Write((short)m_Image.Height);
+
+                for (int y = 0; y < m_Image.Height; y++)
+                {
+                    for (int x = 0; x < m_Image.Width; x += 2)
+                    {
+                        switch (m_Image.PixelFormat)
+                        {
+                            case PixelFormat.Format4bppIndexed:
+                                Color pix4_1 = m_Image.GetPixel(x, y);
+                                Color pix4_2 = m_Image.GetPixel(x + 1, y);
+
+                                byte final_pix4 = (byte)palette_colors.IndexOf(pix4_1);
+                                final_pix4 |= (byte)((palette_colors.IndexOf(pix4_2)) << 4);
+
+                                writer.Write(final_pix4);
+                                break;
+                            case PixelFormat.Format8bppIndexed:
+                                break;
+                        }
+                    }
                 }
             }
-
-            int image_size = reader.ReadInt32() - 12; // The header is 12 bytes long
-
-            short image_offset_x = reader.ReadInt16();
-            short image_offset_y = reader.ReadInt16();
-
-            int image_width = reader.ReadInt16() * 2; // Multiply the stored value by 2 to get actual width
-            int image_height = reader.ReadInt16();
-
-            m_Image = new Bitmap(image_width, image_height);
-
-            for (int y = 0; y < image_height; y++)
-            {
-                for (int x = 0; x < image_width; x++)
-                {
-                    byte src = reader.ReadByte();
-
-                    m_Image.SetPixel(x, y, clut_colors[0][src]);
-                }
-            }
-
-            m_Image.Save(@"C:\Users\Dylan\Downloads\exar2\fpack_extract\anm\M054A\test.png");
         }
+
+        private BitsPerPixel PixelFormat_To_TIM_BPP(PixelFormat fmt)
+        {
+            switch (fmt)
+            {
+                case PixelFormat.Format4bppIndexed:
+                    return BitsPerPixel.bpp_4;
+                case PixelFormat.Format8bppIndexed:
+                    return BitsPerPixel.bpp_8;
+                case PixelFormat.Format16bppRgb565:
+                    return BitsPerPixel.bpp_16;
+                case PixelFormat.Format24bppRgb:
+                    return BitsPerPixel.bpp_24;
+                default:
+                    return BitsPerPixel.bpp_24;
+            }
+        }
+        #endregion
     }
 }

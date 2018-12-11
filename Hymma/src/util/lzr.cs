@@ -16,6 +16,8 @@ using System.Diagnostics;
  * //   email: asmodean [at] hush.com
  * //   irc:   asmodean on efnet (irc.efnet.net)
  * 
+ * Similarly, the compression routine was written by CUE in C and adapted to C# by Gamma/SageOfMirrors.
+ * Thanks! ¡Muchas gracias!
  */
 
 namespace Hymma.Util
@@ -103,8 +105,90 @@ namespace Hymma.Util
             return new EndianBinaryReader(dest, Endian.Little);
         }
 
-        public static byte[] Compress()
+        public static byte[] Compress(EndianBinaryReader reader)
         {
+            List<byte> data_buffer = new List<byte>();
+            List<byte> flag_buffer = new List<byte>();
+
+            // These are all copied + translated from CUE's code.
+            uint times = 0, sum = 0;
+            uint most_times = 0, best_sum = 0;
+            long update = 0;
+            long src_offset = 0, data_offset = 0, end = 0, nor_offset = 0, normal_offset = 0;
+
+            uint method;
+            uint best_method;
+
+            byte[] normal = new byte[256];
+
+            end = reader.BaseStream.Length;
+
+            while (reader.BaseStream.Position < end)
+            {
+                most_times = 0;
+
+                #region DestCopy
+                if (src_offset >= reader.BaseStream.Position + 0xFFF)
+                    sum = 0xFFF;
+                else
+                    sum = (uint)(src_offset - reader.BaseStream.Position);
+
+                for ( ; sum > 0; sum--)
+                {
+                    for (times = 0; times < 0xF; times++)
+                    {
+                        if (src_offset + times >= end || times >= sum)
+                            break;
+                        if (reader.ReadByteAt(src_offset + times) != reader.ReadByteAt(src_offset + times - sum))
+                            break;
+                    }
+
+                    if ((times >= most_times) && times > 2)
+                    {
+                        most_times = times;
+                        best_sum = sum;
+                        best_method = (uint)CopyMode.DestCopy;
+                    }
+                }
+                #endregion
+
+                #region InPlaceCopy
+                for (times = 1; times < 0x7F; times++)
+                {
+                    if (src_offset + times >= end - 1)
+                        break;
+                    if (reader.ReadByteAt(src_offset + times) != (reader.ReadByteAt(src_offset)))
+                        break;
+                }
+
+                if ((times >= most_times) && times > 2)
+                {
+                    most_times = times;
+                    best_method = (uint)CopyMode.InPlaceCopy;
+                }
+                #endregion
+
+                #region RunCopy and DirectCopy
+                if (most_times == 0)
+                {
+                    normal[nor_offset++] = reader.ReadByteAt(src_offset++);
+                    update = (nor_offset == normal_offset + 0xFF) ? 1 : 0;
+                }
+                else
+                {
+                    update = (nor_offset > normal_offset) ? 1 : 0;
+                }
+
+                if (update > 0)
+                {
+                    times = (uint)(nor_offset - normal_offset);
+
+                    //method <<= 2;
+                }
+                #endregion
+
+            }
+
             return new byte[0];
         }
     }
